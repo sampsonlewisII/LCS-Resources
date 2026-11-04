@@ -1,0 +1,4 @@
+config.json
+lcs_resources.log
+__pycache__/
+*.pyc
