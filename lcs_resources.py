@@ -1,6 +1,7 @@
-"""LCS-Resources: tiny always-on-top CPU / GPU / RAM overlay (LionClad Studios).
+"""LCS-Resources: tiny always-on-top CPU / GPU / VRAM / GPU temp / RAM / network overlay.
 
-Drag to move. Mouse wheel = opacity. Right-click = menu. Ctrl+Shift+M = show/hide.
+Drag to move. Mouse wheel = opacity. Right-click = menu (Show submenu toggles each row).
+Ctrl+Shift+M = show/hide.
 Run with pythonw.exe so no console window appears.
 """
 import ctypes
@@ -9,6 +10,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 import tkinter as tk
 from ctypes import wintypes
 
@@ -29,7 +31,12 @@ STARTUP_LNK = os.path.join(
     os.environ.get("APPDATA", ""),
     r"Microsoft\Windows\Start Menu\Programs\Startup\LCS-Resources.lnk",
 )
-DEFAULTS = {"x": None, "y": 40, "opacity": 0.85, "visible": True, "refresh_ms": 1000}
+ROW_ORDER = ("CPU", "GPU", "VRAM", "TEMP", "RAM", "NET")
+ROW_LABELS = {"CPU": "CPU", "GPU": "GPU", "VRAM": "VRAM", "TEMP": "GPU temp (F)",
+              "RAM": "RAM", "NET": "Network"}
+DEFAULTS = {"x": None, "y": 40, "opacity": 0.85, "visible": True, "refresh_ms": 1000,
+            "rows": {k: True for k in ROW_ORDER}}
+NET_COLOR = "#9ecbff"
 HOTKEY_ID = 1
 MOD_CONTROL, MOD_SHIFT, MOD_NOREPEAT = 0x0002, 0x0004, 0x4000
 VK_M = 0x4D
@@ -54,6 +61,10 @@ def load_config():
             cfg.update(json.load(f))
     except (OSError, ValueError):
         pass
+    rows = cfg.get("rows") if isinstance(cfg.get("rows"), dict) else {}
+    cfg["rows"] = {k: bool(rows.get(k, True)) for k in ROW_ORDER}
+    if not any(cfg["rows"].values()):
+        cfg["rows"]["CPU"] = True
     return cfg
 
 
@@ -67,14 +78,22 @@ def save_config(cfg):
         log(f"save_config failed: {e}")
 
 
-def color_for(pct):
-    if pct is None:
+def color_for(val, warn=50, hot=80):
+    if val is None:
         return "#8a8a8a"
-    if pct < 50:
+    if val < warn:
         return "#9be59b"
-    if pct < 80:
+    if val < hot:
         return "#ffd166"
     return "#ff6b6b"
+
+
+def fmt_speed(bps):
+    if bps >= 1e8:
+        return f"{bps / 1e6:.0f}M"
+    if bps >= 1e6:
+        return f"{bps / 1e6:.1f}M"
+    return f"{bps / 1e3:.0f}K"
 
 
 class App:
@@ -93,17 +112,18 @@ class App:
 
         self.rows = {}
         font = ("Consolas", 11, "bold")
-        for name in ("CPU", "GPU", "RAM"):
-            lbl = tk.Label(r, text=f"{name}   --%", font=font, fg="#9be59b",
-                           bg="#14161a", anchor="w", padx=8, pady=1)
-            lbl.pack(fill="x")
-            self.rows[name] = lbl
+        for name in ROW_ORDER:
+            self.rows[name] = tk.Label(r, text=f"{name:<4} --", font=font, fg="#9be59b",
+                                       bg="#14161a", anchor="w", padx=8, pady=1, width=17)
         self.warn = tk.Label(r, text="", font=("Consolas", 8), fg="#ff6b6b",
                              bg="#14161a", anchor="w", padx=8)
+        self._net_prev = None  # (time, bytes_recv, bytes_sent)
 
         self._drag = None
         self.autostart_var = tk.BooleanVar(value=os.path.exists(STARTUP_LNK))
+        self.row_vars = {k: tk.BooleanVar(value=self.cfg["rows"][k]) for k in ROW_ORDER}
         self.menu = self._build_menu()
+        self._apply_rows(first=True)
         for w in (r, *self.rows.values(), self.warn):
             w.bind("<ButtonPress-1>", self._drag_start)
             w.bind("<B1-Motion>", self._drag_move)
@@ -135,6 +155,33 @@ class App:
         x = max(0, min(int(x), sw - w))
         y = max(0, min(int(y), sh - h))
         r.geometry(f"+{x}+{y}")
+
+    def _apply_rows(self, first=False):
+        for lbl in self.rows.values():
+            lbl.pack_forget()
+        for name in ROW_ORDER:
+            if self.cfg["rows"][name]:
+                self.rows[name].pack(fill="x", before=self.warn if self.warn.winfo_ismapped() else None)
+        self._net_prev = None
+        if self.cfg["rows"]["CPU"]:
+            psutil.cpu_percent(interval=None)  # re-prime so the next reading is real
+        if not first:
+            self.root.update_idletasks()
+            r = self.root
+            x = max(0, min(r.winfo_x(), r.winfo_screenwidth() - r.winfo_reqwidth()))
+            y = max(0, min(r.winfo_y(), r.winfo_screenheight() - r.winfo_reqheight()))
+            r.geometry(f"+{x}+{y}")
+            if self.visible:
+                self._sample()
+
+    def _row_toggled(self, key):
+        want = self.row_vars[key].get()
+        if not want and sum(self.cfg["rows"].values()) <= 1:
+            self.row_vars[key].set(True)  # never leave the overlay empty
+            return
+        self.cfg["rows"][key] = want
+        self._apply_rows()
+        save_config(self.cfg)
 
     def _save_soon(self):
         if self.save_job:
@@ -169,6 +216,11 @@ class App:
         for p in (25, 50, 75, 100):
             sub.add_command(label=f"{p}%", command=lambda p=p: self.set_opacity(p / 100))
         m.add_cascade(label="Opacity (wheel also works)", menu=sub)
+        show = tk.Menu(m, tearoff=0)
+        for k in ROW_ORDER:
+            show.add_checkbutton(label=ROW_LABELS[k], variable=self.row_vars[k],
+                                 command=lambda k=k: self._row_toggled(k))
+        m.add_cascade(label="Show", menu=show)
         m.add_command(label="Reset position", command=self._reset_pos)
         m.add_checkbutton(label="Start with Windows", variable=self.autostart_var,
                           command=self._toggle_autostart)
@@ -217,6 +269,7 @@ class App:
             self.root.attributes("-topmost", True)
             self.visible = True
             psutil.cpu_percent(interval=None)
+            self._net_prev = None
             self._tick()
         self.cfg["visible"] = self.visible
         save_config(self.cfg)
@@ -247,20 +300,56 @@ class App:
         self.root.after(150, self._poll_hotkey)
 
     # ---- sampling (only runs while visible)
+    def _gpu_read(self, fn):
+        if _GPU is None:
+            return None
+        try:
+            return fn()
+        except Exception:
+            return None
+
+    def _sample(self):
+        on = self.cfg["rows"]  # hidden rows are never sampled
+        vals = {}
+        if on["CPU"]:
+            vals["CPU"] = psutil.cpu_percent(interval=None)
+        if on["RAM"]:
+            vals["RAM"] = psutil.virtual_memory().percent
+        if on["GPU"]:
+            vals["GPU"] = self._gpu_read(lambda: pynvml.nvmlDeviceGetUtilizationRates(_GPU).gpu)
+        if on["VRAM"]:
+            def vram():
+                mi = pynvml.nvmlDeviceGetMemoryInfo(_GPU)
+                return mi.used * 100.0 / mi.total
+            vals["VRAM"] = self._gpu_read(vram)
+        if on["TEMP"]:
+            c = self._gpu_read(lambda: pynvml.nvmlDeviceGetTemperature(_GPU, 0))
+            vals["TEMP"] = None if c is None else c * 9 / 5 + 32
+
+        for name, val in vals.items():
+            if val is None:
+                txt, col = f"{name:<4} n/a", color_for(None)
+            elif name == "TEMP":
+                txt, col = f"{name:<4} {val:3.0f}°F", color_for(val, 140, 167)
+            else:
+                txt, col = f"{name:<4} {val:3.0f}%", color_for(val)
+            self.rows[name].config(text=txt, fg=col)
+
+        if on["NET"]:
+            n, now = psutil.net_io_counters(), time.monotonic()
+            if self._net_prev is None:
+                txt = "NET  ↓--   ↑--"
+            else:
+                dt = max(now - self._net_prev[0], 0.001)
+                txt = (f"NET  ↓{fmt_speed((n.bytes_recv - self._net_prev[1]) / dt)}"
+                       f" ↑{fmt_speed((n.bytes_sent - self._net_prev[2]) / dt)}")
+            self._net_prev = (now, n.bytes_recv, n.bytes_sent)
+            self.rows["NET"].config(text=txt, fg=NET_COLOR)
+
     def _tick(self):
         if not self.visible:
             return
-        cpu = psutil.cpu_percent(interval=None)
-        ram = psutil.virtual_memory().percent
-        gpu = None
-        if _GPU is not None:
-            try:
-                gpu = pynvml.nvmlDeviceGetUtilizationRates(_GPU).gpu
-            except Exception:
-                gpu = None
-        for name, val in (("CPU", cpu), ("GPU", gpu), ("RAM", ram)):
-            txt = f"{name}  {val:3.0f}%" if val is not None else f"{name}  n/a"
-            self.rows[name].config(text=txt, fg=color_for(val))
+        self._sample()
         self.root.after(int(self.cfg["refresh_ms"]), self._tick)
 
     def run(self):
