@@ -12,6 +12,7 @@ import sys
 import threading
 import time
 import tkinter as tk
+from collections import deque
 from ctypes import wintypes
 
 import psutil
@@ -31,11 +32,11 @@ STARTUP_LNK = os.path.join(
     os.environ.get("APPDATA", ""),
     r"Microsoft\Windows\Start Menu\Programs\Startup\LCS-Resources.lnk",
 )
-ROW_ORDER = ("CPU", "GPU", "VRAM", "TEMP", "RAM", "NET")
+ROW_ORDER = ("CPU", "GPU", "VRAM", "TEMP", "RAM", "NET", "FPS")
 ROW_LABELS = {"CPU": "CPU", "GPU": "GPU", "VRAM": "VRAM", "TEMP": "GPU temp (F)",
-              "RAM": "RAM", "NET": "Network"}
+              "RAM": "RAM", "NET": "Network", "FPS": "FPS (needs PresentMon)"}
 DEFAULTS = {"x": None, "y": 40, "opacity": 0.85, "visible": True, "refresh_ms": 1000,
-            "rows": {k: True for k in ROW_ORDER}}
+            "presentmon_path": "", "rows": {k: True for k in ROW_ORDER}}
 NET_COLOR = "#9ecbff"
 HOTKEY_ID = 1
 MOD_CONTROL, MOD_SHIFT, MOD_NOREPEAT = 0x0002, 0x0004, 0x4000
@@ -88,6 +89,166 @@ def color_for(val, warn=50, hot=80):
     return "#ff6b6b"
 
 
+def fps_color(fps):
+    if fps is None:
+        return "#8a8a8a"
+    if fps < 30:
+        return "#ff6b6b"
+    if fps < 60:
+        return "#ffd166"
+    return "#9be59b"
+
+
+user32.GetForegroundWindow.restype = wintypes.HWND
+user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+
+
+def foreground_pid():
+    pid = wintypes.DWORD(0)
+    user32.GetWindowThreadProcessId(user32.GetForegroundWindow(), ctypes.byref(pid))
+    return pid.value
+
+
+def make_kill_job():
+    """A Windows job object that kills its processes when this app dies, so the
+    PresentMon helper can never be left running if the overlay is force-killed."""
+    class BASIC(ctypes.Structure):
+        _fields_ = [("PerProcessUserTimeLimit", ctypes.c_int64), ("PerJobUserTimeLimit", ctypes.c_int64),
+                    ("LimitFlags", wintypes.DWORD), ("MinimumWorkingSetSize", ctypes.c_size_t),
+                    ("MaximumWorkingSetSize", ctypes.c_size_t), ("ActiveProcessLimit", wintypes.DWORD),
+                    ("Affinity", ctypes.c_size_t), ("PriorityClass", wintypes.DWORD),
+                    ("SchedulingClass", wintypes.DWORD)]
+
+    class IOC(ctypes.Structure):
+        _fields_ = [(n, ctypes.c_uint64) for n in ("a", "b", "c", "d", "e", "f")]
+
+    class EXT(ctypes.Structure):
+        _fields_ = [("Basic", BASIC), ("Io", IOC), ("ProcessMemoryLimit", ctypes.c_size_t),
+                    ("JobMemoryLimit", ctypes.c_size_t), ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                    ("PeakJobMemoryUsed", ctypes.c_size_t)]
+
+    kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+    job = kernel32.CreateJobObjectW(None, None)
+    info = EXT()
+    info.Basic.LimitFlags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+    kernel32.SetInformationJobObject(wintypes.HANDLE(job), 9, ctypes.byref(info), ctypes.sizeof(info))
+    return job
+
+
+class FpsMeter:
+    """Foreground-app FPS from Intel's PresentMon (reads Windows' own present events;
+    nothing is injected into any game). Runs only while the FPS row is on and visible."""
+    SESSION = "LCS-Resources"
+
+    def __init__(self, exe):
+        self.exe = exe
+        self.proc = None
+        self.frames = {}  # pid -> deque of PresentMon frame times (seconds), last 1 s
+        self.last_seen = {}  # pid -> when we last received a frame from it
+        self.lock = threading.Lock()
+        self.job = None
+        self._kids, self._kids_for, self._kids_at = [], None, 0.0
+
+    def available(self):
+        return bool(self.exe) and os.path.exists(self.exe)
+
+    def running(self):
+        return self.proc is not None and self.proc.poll() is None
+
+    def start(self):
+        if self.running() or not self.available():
+            return
+        with self.lock:
+            self.frames.clear()
+            self.last_seen.clear()
+        try:
+            self.proc = subprocess.Popen(
+                [self.exe, "--output_stdout", "--no_console_stats", "--v1_metrics",
+                 "--exclude_dropped", "--session_name", self.SESSION, "--stop_existing_session"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+                creationflags=0x08000000)  # CREATE_NO_WINDOW
+        except OSError as e:
+            log(f"PresentMon start failed: {e}")
+            self.proc = None
+            return
+        try:
+            if self.job is None:
+                self.job = make_kill_job()
+            kernel32.AssignProcessToJobObject(wintypes.HANDLE(self.job), wintypes.HANDLE(int(self.proc._handle)))
+        except Exception as e:
+            log(f"job assign failed: {e}")
+        threading.Thread(target=self._reader, args=(self.proc,), daemon=True).start()
+
+    def stop(self):
+        proc, self.proc = self.proc, None
+        if proc is None:
+            return
+        try:  # ask PresentMon to end its trace session cleanly, then make sure it's gone
+            subprocess.run([self.exe, "--terminate_existing_session", "--session_name", self.SESSION],
+                           creationflags=0x08000000, timeout=5, capture_output=True)
+        except Exception as e:
+            log(f"PresentMon stop failed: {e}")
+        if proc.poll() is None:
+            proc.terminate()
+        with self.lock:
+            self.frames.clear()
+            self.last_seen.clear()
+
+    def _reader(self, proc):
+        seen_header = False
+        for raw in proc.stdout:
+            line = raw.decode("utf-8", "ignore")
+            if not seen_header:
+                seen_header = line.startswith("Application,")
+                continue
+            parts = line.split(",")
+            try:
+                pid = int(parts[1])
+                if parts[6].strip() == "1":  # dropped frame, never shown
+                    continue
+                t = float(parts[7])  # PresentMon's own frame timestamp (immune to pipe buffering)
+            except (IndexError, ValueError):
+                continue
+            if proc is not self.proc:
+                return
+            with self.lock:
+                dq = self.frames.setdefault(pid, deque())
+                dq.append(t)
+                while dq[0] < t - 1.0:  # keep one second of frames per process
+                    dq.popleft()
+                self.last_seen[pid] = time.monotonic()
+
+    def _count(self, pids):
+        """Average FPS over the last second of frames: (frames - 1) / time span."""
+        now = time.monotonic()
+        best = 0.0
+        with self.lock:
+            for p in list(self.frames):
+                if now - self.last_seen.get(p, 0) > 2.0:  # stopped presenting
+                    del self.frames[p]
+                    self.last_seen.pop(p, None)
+            for p in pids:
+                dq = self.frames.get(p)
+                if dq and len(dq) >= 2 and dq[-1] > dq[0]:
+                    best = max(best, (len(dq) - 1) / (dq[-1] - dq[0]))
+        return round(best) or None
+
+    def fps_for(self, pid):
+        """Frames per second of the foreground app: its own process first, then its
+        child processes (browsers and launchers often present from a child)."""
+        fps = self._count((pid,))
+        if fps is None and pid:
+            now = time.monotonic()
+            if self._kids_for != pid or now - self._kids_at > 5.0:  # process-tree walk is the costly part
+                try:
+                    self._kids = [c.pid for c in psutil.Process(pid).children(recursive=True)]
+                except psutil.Error:
+                    self._kids = []
+                self._kids_for, self._kids_at = pid, now
+            fps = self._count(self._kids) if self._kids else None
+        return fps
+
+
 def fmt_speed(bps):
     if bps >= 1e8:
         return f"{bps / 1e6:.0f}M"
@@ -118,6 +279,11 @@ class App:
         self.warn = tk.Label(r, text="", font=("Consolas", 8), fg="#ff6b6b",
                              bg="#14161a", anchor="w", padx=8)
         self._net_prev = None  # (time, bytes_recv, bytes_sent)
+        pm = self.cfg.get("presentmon_path") or next(
+            (p for p in (os.path.join(HERE, "bin", "PresentMon.exe"), os.path.join(HERE, "PresentMon.exe"))
+             if os.path.exists(p)), "")
+        self.fps = FpsMeter(pm)
+        self.visible = bool(self.cfg["visible"])
 
         self._drag = None
         self.autostart_var = tk.BooleanVar(value=os.path.exists(STARTUP_LNK))
@@ -135,9 +301,9 @@ class App:
         self._place()
         psutil.cpu_percent(interval=None)  # prime the counter
 
-        self.visible = bool(self.cfg["visible"])
         if not self.visible:
             r.withdraw()
+        self._fps_sync()
 
         threading.Thread(target=self._hotkey_thread, daemon=True).start()
         r.after(150, self._poll_hotkey)
@@ -171,8 +337,16 @@ class App:
             x = max(0, min(r.winfo_x(), r.winfo_screenwidth() - r.winfo_reqwidth()))
             y = max(0, min(r.winfo_y(), r.winfo_screenheight() - r.winfo_reqheight()))
             r.geometry(f"+{x}+{y}")
+            self._fps_sync()
             if self.visible:
                 self._sample()
+
+    def _fps_sync(self):
+        """PresentMon runs only while the FPS row is on and the overlay is visible."""
+        if self.visible and self.cfg["rows"]["FPS"]:
+            self.fps.start()
+        else:
+            self.fps.stop()
 
     def _row_toggled(self, key):
         want = self.row_vars[key].get()
@@ -264,17 +438,20 @@ class App:
         if self.visible:
             self.root.withdraw()
             self.visible = False
+            self._fps_sync()
         else:
             self.root.deiconify()
             self.root.attributes("-topmost", True)
             self.visible = True
             psutil.cpu_percent(interval=None)
             self._net_prev = None
+            self._fps_sync()
             self._tick()
         self.cfg["visible"] = self.visible
         save_config(self.cfg)
 
     def quit(self):
+        self.fps.stop()
         save_config(self.cfg)
         self.root.destroy()
 
@@ -345,6 +522,13 @@ class App:
                        f" ↑{fmt_speed((n.bytes_sent - self._net_prev[2]) / dt)}")
             self._net_prev = (now, n.bytes_recv, n.bytes_sent)
             self.rows["NET"].config(text=txt, fg=NET_COLOR)
+
+        if on["FPS"]:
+            if not self.fps.available():
+                self.rows["FPS"].config(text="FPS  see README", fg=color_for(None))
+            else:
+                fps = self.fps.fps_for(foreground_pid())
+                self.rows["FPS"].config(text=f"FPS  {fps:3d}" if fps else "FPS   --", fg=fps_color(fps))
 
     def _tick(self):
         if not self.visible:
